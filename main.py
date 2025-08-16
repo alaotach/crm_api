@@ -1068,3 +1068,86 @@ def get_resource_audit_logs(
         "count": len(result.data)
     }
 
+@app.post("/generate-email")
+def gen_email(request: dict, current_user: dict = Depends(get_current_user)):
+    customer_id = request.get("customer_id")
+    type = request.get("type")
+    customer = db.table("customers").select("*").eq("id", customer_id).execute()
+    deals = db.table("deals").select("*").eq("customer_id", customer_id).execute()
+    r = requests.post("https://ai.hackclub.com/chat/completions", headers={
+        "Content-Type": "application/json"
+    }, json={
+        "model": "openai/gpt-oss-120b",
+        "messages": [
+            {"role": "user", "content": f"""
+                Write a professional {type} email for:
+                Customer: {customer['name']} at {customer.get('company')}
+                Email: {customer.get('email')}
+                Active Deals: {len(deals)} worth ${sum(d.get('amt', 0) for d in deals)}
+
+                Make it:
+                - Professional but friendly
+                - Personalized
+                - Under 150 words
+
+                Include subject line."""}
+        ]
+    })
+    return {"email": r.json()['choices'][0]['message']['content']}
+
+@app.post("handle-objection")
+def handle_objection(request: dict, current_user: dict = Depends(get_current_user)):
+    """Get AI help for handling customer objections"""
+    objection = request.get("objection")
+    context = request.get("context", "")
+    
+    r = requests.post("https://ai.hackclub.com/chat/completions", headers={
+        "Content-Type": "application/json"
+    }, json={
+        "model": "openai/gpt-oss-120b",
+        "messages": [{
+            "role": "user",
+            "content": f"""
+            help handle this sales objection:
+            objection: "{objection}"
+            context: {context}
+
+            provide:
+            1. 3 different response approaches
+            2. questions to ask back
+            3. evidence/proof points to use
+            4. how to redirect conversation
+            5. when to concede vs push back
+            be practical and conversational."""
+                    }]
+    })
+    
+    return {"response": r.json()['choices'][0]['message']['content']}
+
+@app.post("/meeting-prep")
+def meeting_prep(customer_id: str, current_user: dict = Depends(get_current_user)):
+    customer = db.table("customers").select("*").eq("id", customer_id).execute().data[0]
+    deals = db.table("deals").select("*").eq("customer_id", customer_id).execute().data
+    notes = db.table("notes").select("*").eq("customer_id", customer_id).execute().data[-5:]
+    r = requests.post("https://ai.hackclub.com/chat/completions", headers={
+        "Content-Type": "application/json"
+    }, json={
+        "model": "openai/gpt-oss-120b",
+        "messages": [
+            {"role": "user", "content": f"""
+                Create a meeting prep brief for:
+                Customer: {customer['name']} ({customer.get('company')})
+                Active Deals: {len(deals)} worth ${sum(d.get('amt', 0) for d in deals)}
+                Recent History: {len(notes)} recent interactions
+
+                Provide:
+                1. Key talking points
+                2. Questions to ask
+                3. Potential objections & responses
+                4. Goals for this meeting
+                5. Follow-up actions
+
+                Keep it concise and actionable."""}
+        ]
+    })
+    return {"prep": r.json()['choices'][0]['message']['content']}
