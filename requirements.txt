@@ -1,0 +1,6 @@
+fastapi
+pydantic
+supabase
+hashlib
+secrets
+base64

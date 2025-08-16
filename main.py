@@ -1,25 +1,113 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import csv
-from csv import DictReader, DictWriter
+from csv import DictWriter
 import json
 import io
 from fastapi.responses import Response
 from fastapi import File, UploadFile
+import jwt
+import hashlib
+import secrets
+import base64
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+JWT_KEY = os.getenv('JWT_KEY')
+JWT_ALGO = 'HS256'
+JWT_EXPIRE = 1800
 
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="CRM")
+security = HTTPBearer()
+
+def create_jwt_token(data: dict) -> str:
+    payload = {
+        **data,
+        "exp": datetime.utcnow() + timedelta(seconds=JWT_EXPIRE)
+    }
+    token = jwt.encode(payload, JWT_KEY, algorithm=JWT_ALGO)
+    return token
+
+def custom_hash_password(password: str, salt: str = None) -> tuple:
+    if salt is None:
+        salt = secrets.token_hex(32)
+    salted = password + salt
+    for _ in range(6969):
+        salted = hashlib.sha256(salted.encode()).hexdigest()
+
+    return salted, salt
+
+def log_audit_event(
+    user_id: str = None,
+    action: str = None,
+    type: str = None,
+    resource_id: str = None,
+    details: str = None,
+    ip: str = None,
+    agent: str = None
+):
+    try:
+        audit_data = {
+            "user_id": user_id,
+            "action": action,
+            "type": type,
+            "resource_id": resource_id,
+            "details": details,
+            "ip": ip,
+            "agent": agent,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        db.table("audit_logs").insert(audit_data).execute()
+    except Exception as e:
+        print(f"Audit logging failed: {str(e)}")
+
+def get_client_info(request: Request):
+    ip = request.client.host if request.client else None
+    agent = request.headers.get("user-agent")
+    return ip, agent
+
+def verify(password, hashed, salt):
+    test_hash, _ = custom_hash_password(password, salt)
+    return test_hash == hashed
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_KEY, algorithms=[JWT_ALGO])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user_id
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=401,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+def get_current_user(user_id: str = Depends(verify_token)):
+    user = db.table("users").select("*").eq("id", user_id).execute()
+    if not user.data:
+        raise HTTPException(
+            status_code=401,
+            detail="User not found"
+        )
+    return user.data[0]
 
 class Customer(BaseModel):
     id: str = None
@@ -56,65 +144,170 @@ class User(BaseModel):
 class Assignment(BaseModel):
     assigned_to: str
 
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str = "sales_rep"
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+class AuditLog(BaseModel):
+    id: str = None
+    user_id: str = None
+    action: str
+    type: str = None
+    resource_id: str = None
+    details: str = None
+    ip: str = None
+    agent: str = None
+    timestamp: str = None
+
 @app.get("/customers")
-def list_customers(assigned_to: str = None):
+def list_customers(request: Request, assigned_to: str = None, current_user: dict = Depends(get_current_user)):
+    ip, agent = get_client_info(request)
+    
     query = db.table('customers').select('*')
     if assigned_to:
         query = query.eq("assigned_to", assigned_to)
-    return query.execute().data
+    elif current_user["role"] == "sales_rep":
+        query = query.eq("assigned_to", current_user["id"])
+    
+    result = query.execute().data
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="READ",
+        type="customer",
+        details=json.dumps({"filter": {"assigned_to": assigned_to}, "count": len(result)}),
+        ip=ip,
+        agent=agent
+    )
+    
+    return result
 
 @app.post("/customers")
-def create_customer(customer: Customer):
+def create_customer(customer: Customer, request: Request, current_user: dict = Depends(get_current_user)):
+    ip, agent = get_client_info(request)
     data = customer.dict(exclude_unset=True)
+    original_data = data.copy()
     data.pop("id", None)
     if data.get('assigned_to'):
         user = db.table("users").select("*").eq("id", data['assigned_to']).execute()
         if not user.data:
             raise HTTPException(status_code=400, detail="Assigned user not found")
     
-    return (db.table('customers').insert(data).execute()).data
+    result = (db.table('customers').insert(data).execute()).data
+    
+    if result:
+        log_audit_event(
+            user_id=current_user["id"],
+            action="CREATE",
+            type="customer",
+            resource_id=result[0].get("id"),
+            details=json.dumps({"created_data": original_data}),
+            ip=ip,
+            agent=agent
+        )
+    
+    return result
 
 @app.put("/customers/{id}")
-def update_customer(id: str, customer: Customer):
+def update_customer(id: str, customer: Customer, request: Request, current_user: dict = Depends(get_current_user)):
+    ip, agent = get_client_info(request)
+    
+    existing_customer = db.table("customers").select("*").eq("id", id).execute()
+    if not existing_customer.data:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if (current_user["role"] == "sales_rep" and 
+        existing_customer.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to update this customer")
     data = customer.dict(exclude_unset=True)
+    update_data = data.copy()
     data.pop("id", None)
     if data.get('assigned_to'):
         user = db.table("users").select("*").eq("id", data['assigned_to']).execute()
         if not user.data:
             raise HTTPException(status_code=400, detail="Assigned user not found")
-    
     resp = db.table("customers").update(data).eq("id", id).execute()
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="UPDATE",
+        type="customer",
+        resource_id=id,
+        details=json.dumps({
+            "old_data": existing_customer.data[0],
+            "new_data": update_data
+        }),
+        ip=ip,
+        agent=agent
+    )
+    
     return resp.data
 
 @app.delete("/customers/{id}")
-def delete_customer(id: str):
+def delete_customer(id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    client_info = get_client_info(request)
+    
+    existing_customer = db.table("customers").select("*").eq("id", id).execute()
+    if not existing_customer.data:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if (current_user["role"] == "sales_rep" and 
+        existing_customer.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this customer")
     resp = db.table("customers").delete().eq("id", id).execute()
     if not resp.data:
         raise HTTPException(status_code=404, detail="Customer not found")
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="DELETE",
+        type="customer",
+        resource_id=id,
+        details={"deleted_data": existing_customer.data[0]},
+        **client_info
+    )
+    
     return {"ok": True}
 
 @app.get("/customers/{id}")
-def get_customer(id: str):
-    resp = db.table("customers").select("*, users!customers_assigned_to_fkey(id, name, email)").eq("id", id).execute()
-    if not resp.data:
+def get_customer(id: str, current_user: dict = Depends(get_current_user)):
+    customer = db.table("customers").select("*, users!customers_assigned_to_fkey(id, name, email)").eq("id", id).execute()
+    if not customer.data:
         raise HTTPException(status_code=404, detail="Customer not found")
-    return resp.data[0]
+    if (current_user["role"] == "sales_rep" and 
+        customer.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to view this customer")
+    return customer.data[0]
 
 @app.get("/deals")
-def list_deals(assigned_to: str= None ):
+def list_deals(assigned_to: str = None, current_user: dict = Depends(get_current_user)):
     query = db.table('deals').select('*, users!deals_assigned_to_fkey(id, name, email), customers!deals_customer_id_fkey(id, name, company)')
-    
     if assigned_to:
         query = query.eq('assigned_to', assigned_to)
-    
+    elif current_user["role"] == "sales_rep":
+        query = query.eq('assigned_to', current_user["id"])
     return query.execute().data
 
+
+
 @app.post("/deals")
-def create_deal(deal: Deal):
+def create_deal(deal: Deal, current_user: dict = Depends(get_current_user)):
     data = deal.dict(exclude_unset=True)
     data.pop("id", None)
+    if not data.get('assigned_to') and current_user["role"] == "sales_rep":
+        data['assigned_to'] = current_user["id"]
     if data.get('assigned_to'):
         user = db.table("users").select("*").eq("id", data['assigned_to']).execute()
         if not user.data:
@@ -126,7 +319,13 @@ def create_deal(deal: Deal):
     return (db.table('deals').insert(data).execute()).data
 
 @app.put("/deals/{deal_id}")
-def update_deal(deal_id: str, deal: Deal):
+def update_deal(deal_id: str, deal: Deal, current_user: dict = Depends(get_current_user)):
+    existing_deal = db.table("deals").select("*").eq("id", deal_id).execute()
+    if not existing_deal.data:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if (current_user["role"] == "sales_rep" and 
+        existing_deal.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to update this deal")
     data = deal.dict(exclude_unset=True)
     data.pop("id", None)
     if data.get('assigned_to'):
@@ -134,23 +333,30 @@ def update_deal(deal_id: str, deal: Deal):
         if not user.data:
             raise HTTPException(status_code=400, detail="Assigned user not found")
     resp = db.table("deals").update(data).eq("id", deal_id).execute()
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Deal not found")
     return resp.data
 
 @app.delete("/deals/{deal_id}")
-def delete_deal(deal_id: str):
+def delete_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
+    existing_deal = db.table("deals").select("*").eq("id", deal_id).execute()
+    if not existing_deal.data:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if (current_user["role"] == "sales_rep" and 
+        existing_deal.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this deal")
     resp = db.table("deals").delete().eq("id", deal_id).execute()
     if not resp.data:
         raise HTTPException(status_code=404, detail="Deal not found")
     return {"ok": True}
 
 @app.get("/deals/{deal_id}")
-def get_deal(deal_id: str):
-    resp = db.table("deals").select("*, users!deals_assigned_to_fkey(id, name, email), customers!deals_customer_id_fkey(id, name, company)").eq("id", deal_id).execute()
-    if not resp.data:
+def get_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
+    deal = db.table("deals").select("*, users!deals_assigned_to_fkey(id, name, email), customers!deals_customer_id_fkey(id, name, company)").eq("id", deal_id).execute()
+    if not deal.data:
         raise HTTPException(status_code=404, detail="Deal not found")
-    return resp.data[0]
+    if (current_user["role"] == "sales_rep" and 
+        deal.data[0].get("assigned_to") != current_user["id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to view this deal")
+    return deal.data[0]
 
 @app.post("/users")
 def create_user(name: str, email: str, password: str):
@@ -184,7 +390,7 @@ def update_deal_status(deal_id: str, status: Status):
     return resp.data
 
 @app.get("/deals/pipeline")
-def get_deals_pipeline(assigned_to: str =None)):
+def get_deals_pipeline(assigned_to: str = None):
     query = db.table('deals').select('*, users!deals_assigned_to_fkey(id, name), customers!deals_customer_id_fkey(id, name, company)')
     if assigned_to:
         query = query.eq('assigned_to', assigned_to)
@@ -231,7 +437,7 @@ def delete_note(note_id: str):
     return {"ok": True}
 
 @app.get("/analytics/deals-summary")
-def get_deals_summary(assigned_to: Optional[str] = Query(None, description="Filter by assigned user ID")):
+def get_deals_summary(assigned_to: str = None):
     query = db.table('deals').select('*')
     if assigned_to:
         query = query.eq('assigned_to', assigned_to)
@@ -278,14 +484,14 @@ def get_customer_value(id: str):
     }
 
 @app.get("/analytics/top-customers")
-def get_top_customers(assigned_to: str = None)):
+def get_top_customers(assigned_to: str = None):
     customerq = db.table('customers').select('*')
     deal_query = db.table('deals').select('*')
     if assigned_to:
         customerq = customerq.eq('assigned_to', assigned_to)
-        dealq = dealq.eq('assigned_to', assigned_to)
+        deal_query = deal_query.eq('assigned_to', assigned_to)
     customers = customerq.execute().data
-    deals = dealq.execute().data
+    deals = deal_query.execute().data
     leaderboard = []
     for customer in customers:
         customer_deals = [d for d in deals if d.get('customer_id') == customer['id']]
@@ -327,7 +533,7 @@ def get_motivation():
     return {"quote": r['choices'][0]['message']['content']}
 
 @app.get("/fun-fact")
-def get_motivation():
+def get_fun_fact():
     r = requests.post("https://ai.hackclub.com/chat/completions", headers={
         "Content-Type": "application/json"
     },
@@ -375,7 +581,7 @@ async def import_customers(file: UploadFile = File(...)):
                     "company": row.get("company"),
                     "phone": row.get("phone"),
                 })
-            customers = [c for c in customers if c.get('name')]  # Filter out customers without names
+            customers = [c for c in customers if c.get('name')]
             db.table("customers").insert(customers).execute()
             return {"message": "Customers imported successfully"}
         elif ext == "json":
@@ -605,3 +811,260 @@ def get_team_performance():
         "total_team_revenue": sum(s['revenue'] for s in team_stats),
         "total_team_potential": sum(s['potential_revenue'] for s in team_stats)
     }
+
+@app.post("/auth/register", response_model=Token)
+def register(user_data: UserCreate, request: Request):
+    client_info = get_client_info(request)
+    
+    exist = db.table("users").select("*").eq("email", user_data.email).execute()
+    if exist.data:
+        log_audit_event(
+            action="REGISTER_FAILED",
+            type="user",
+            details={"reason": "Email already registered", "email": user_data.email},
+            **client_info
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    hashed, salt = custom_hash_password(user_data.password)
+    user_dict = {
+        "name": user_data.name,
+        "email": user_data.email,
+        "password_hash": hashed,
+        "password_salt": salt,
+        "role": user_data.role,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    result = db.table("users").insert(user_dict).execute()
+    if not result.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create user"
+        )
+    user_id = result.data[0]["id"]
+    token_expiry = timedelta(seconds=JWT_EXPIRE)
+    token = create_jwt_token(
+        data={"sub": user_id}, expires_delta=token_expiry
+    )
+    
+    log_audit_event(
+        user_id=user_id,
+        action="REGISTER",
+        type="user",
+        resource_id=user_id,
+        details={"email": user_data.email, "role": user_data.role},
+        **client_info
+    )
+
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/auth/login", response_model=Token)
+def login(user_credentials: UserLogin, request: Request):
+    ip, agent = get_client_info(request)
+    
+    user = db.table("users").select("*").eq("email", user_credentials.email).execute()
+    if not user.data:
+        log_audit_event(
+            action="LOGIN_FAILED",
+            type="user",
+            details=json.dumps({"reason": "User not found", "email": user_credentials.email}),
+            ip=ip,
+            agent=agent
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user_data = user.data[0]
+    if not verify(user_credentials.password, user_data["password_hash"], user_data["password_salt"]):
+        log_audit_event(
+            user_id=user_data["id"],
+            action="LOGIN_FAILED",
+            type="user",
+            details=json.dumps({"reason": "Invalid password", "email": user_credentials.email}),
+            ip=ip,
+            agent=agent
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token_expiry = timedelta(seconds=JWT_EXPIRE)
+    token = create_jwt_token(
+        data={"sub": user_data["id"]}, expires_delta=token_expiry
+    )
+    
+    log_audit_event(
+        user_id=user_data["id"],
+        action="LOGIN",
+        type="user",
+        details=json.dumps({"email": user_credentials.email}),
+        ip=ip,
+        agent=agent
+    )
+    
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/auth/refresh", response_model=Token)
+def refresh_token(current_user: dict = Depends(get_current_user)):
+    token_expiry = timedelta(seconds=JWT_EXPIRE)
+    token = create_jwt_token(
+        data={"sub": current_user["id"]}, expires_delta=token_expiry
+    )
+
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/auth/me")
+def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    user_info = {
+        "id": current_user["id"],
+        "name": current_user["name"],
+        "email": current_user["email"],
+        "role": current_user["role"]
+    }
+    return user_info
+
+@app.post("/auth/change-password")
+def change_password(password_data: PasswordChange, current_user: dict = Depends(get_current_user)):
+    if not verify(password_data.current_password, current_user["password_hash"], current_user["password_salt"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Current password is incorrect"
+        )
+    new_hashed_password, new_salt = custom_hash_password(password_data.new_password)
+    result = db.table("users").update({
+        "password_hash": new_hashed_password,
+        "password_salt": new_salt
+    }).eq("id", current_user["id"]).execute()
+    if not result.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update password"
+        )
+
+    return {"message": "Password changed successfully"}
+
+@app.get("/audit-logs")
+def get_audit_logs(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    user_id: str = None,
+    action: str = None,
+    type: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    limit: int = 100,
+    offset: int = 0
+):
+    if current_user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Not authorized to view audit logs")
+    
+    client_info = get_client_info(request)
+    
+    query = db.table("audit_logs").select("*, users!audit_logs_user_id_fkey(name, email)")
+    
+    if user_id:
+        query = query.eq("user_id", user_id)
+    if action:
+        query = query.eq("action", action)
+    if type:
+        query = query.eq("type", type)
+    if start_date:
+        query = query.gte("timestamp", start_date)
+    if end_date:
+        query = query.lte("timestamp", end_date)
+    
+    result = query.order("timestamp", desc=True).range(offset, offset + limit - 1).execute()
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="VIEW_AUDIT_LOGS",
+        type="audit_log",
+        details={
+            "filters": {
+                "user_id": user_id,
+                "action": action,
+                "type": type,
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "pagination": {"limit": limit, "offset": offset},
+            "count": len(result.data)
+        },
+        **client_info
+    )
+    
+    return {
+        "audit_logs": result.data,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "count": len(result.data)
+        }
+    }
+
+@app.get("/audit-logs/user/{user_id}")
+def get_user_audit_logs(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    limit: int = 50
+):
+    if current_user["id"] != user_id and current_user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Not authorized to view these audit logs")
+    
+    client_info = get_client_info(request)
+    
+    result = db.table("audit_logs").select("*").eq("user_id", user_id).order("timestamp", desc=True).limit(limit).execute()
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="VIEW_USER_AUDIT_LOGS",
+        type="audit_log",
+        details={"target_user_id": user_id, "count": len(result.data)},
+        **client_info
+    )
+    
+    return {
+        "user_id": user_id,
+        "audit_logs": result.data,
+        "count": len(result.data)
+    }
+
+@app.get("/audit-logs/resource/{type}/{resource_id}")
+def get_resource_audit_logs(
+    type: str,
+    resource_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Not authorized to view resource audit logs")
+    
+    client_info = get_client_info(request)
+    
+    result = db.table("audit_logs").select("*, users!audit_logs_user_id_fkey(name, email)").eq("type", type).eq("resource_id", resource_id).order("timestamp", desc=True).execute()
+    
+    log_audit_event(
+        user_id=current_user["id"],
+        action="VIEW_RESOURCE_AUDIT_LOGS",
+        type="audit_log",
+        details={
+            "target_type": type,
+            "target_resource_id": resource_id,
+            "count": len(result.data)
+        },
+        **client_info
+    )
+    
+    return {
+        "type": type,
+        "resource_id": resource_id,
+        "audit_logs": result.data,
+        "count": len(result.data)
+    }
+
