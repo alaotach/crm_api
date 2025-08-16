@@ -73,12 +73,8 @@ JWT_KEY=your_jwt_token
 
 ### 4. Database Setup
 Run the SQL script in your Supabase SQL Editor to create all tables:
+check sql.md for table script
 
-```sql
--- See the complete SQL script in the documentation
--- Creates: users, customers, deals, notes, audit_logs tables
--- Includes: indexes, RLS policies, triggers, sample data
-```
 
 ### 5. Run the Application
 ```bash
